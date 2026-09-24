@@ -11,9 +11,6 @@
 .if-branch-dev: &if-branch-dev
   if: '$CI_COMMIT_BRANCH == "dev"'
 
-.if-branch-develop: &if-branch-develop
-  if: '$CI_COMMIT_BRANCH == "develop"'
-
 .if-branch-staging: &if-branch-staging
   if: '$CI_COMMIT_BRANCH == "staging"'
 
@@ -35,9 +32,6 @@
     - <<: *if-branch-dev
       variables:
         ENVIRONMENT_NAME: "dev"
-    - <<: *if-branch-develop
-      variables:
-        ENVIRONMENT_NAME: "dev"
     - <<: *if-branch-staging
       variables:
         ENVIRONMENT_NAME: "staging"
@@ -51,9 +45,6 @@
     - <<: *if-branch-dev
       variables:
         ENVIRONMENT_NAME: "dev"
-    - <<: *if-branch-develop
-      variables:
-        ENVIRONMENT_NAME: "dev"
     - <<: *if-branch-staging
       variables:
         ENVIRONMENT_NAME: "staging"
@@ -65,10 +56,6 @@
 .rules:deploy-dev:
   rules:
     - <<: *if-branch-dev
-      variables:
-        ENVIRONMENT_NAME: "dev"
-        SERVER_HOST: "dev-server.local"
-    - <<: *if-branch-develop
       variables:
         ENVIRONMENT_NAME: "dev"
         SERVER_HOST: "dev-server.local"
