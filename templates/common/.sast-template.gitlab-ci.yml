@@ -1,0 +1,29 @@
+# Статический анализ кода через semgrep. Не блокирует пайплайн — пока только
+# копим отчёты в GitLab Security Dashboard, решим позже, стоит ли ужесточать
+# до exit 1 на находках.
+.template:sast:
+  stage: sast
+  image: ${INFRA_REGISTRY}/security/semgrep:1.175.1
+  tags:
+    - tests
+  variables:
+    SEMGREP_CONFIG: "p/auto" # Переопределяется в сервисе (напр. p/python, p/golang)
+  script:
+    - semgrep --config=${SEMGREP_CONFIG} --json --output=/tmp/semgrep-results.json .
+    - cp /tmp/semgrep-results.json ${CI_PROJECT_DIR}/semgrep-results.json
+    - |
+      if [ -s ${CI_PROJECT_DIR}/semgrep-results.json ]; then
+        FINDINGS=$(cat ${CI_PROJECT_DIR}/semgrep-results.json | grep -c '"check_id"' || true)
+        if [ "$FINDINGS" -gt 0 ]; then
+          echo "❌ SAST found ${FINDINGS} findings"
+        else
+          echo "✅ No SAST findings"
+        fi
+      fi
+  artifacts:
+    when: always
+    paths:
+      - semgrep-results.json
+    reports:
+      sast: semgrep-results.json
+    expire_in: 1 week

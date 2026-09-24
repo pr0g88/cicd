@@ -1,0 +1,56 @@
+# Юнит-тесты + jacoco-покрытие для Java/Maven-сервисов. Код уже зачекаучен
+# раннером, отдельно клонировать репо не нужно. Порог — 30%.
+.template:java-maven-unit-test:
+  stage: unit-test
+  image: maven:3.8-eclipse-temurin-17
+  tags:
+    - tests
+  script:
+    - |
+      mvn test -B
+      mvn verify -B
+      mvn jacoco:report -B
+    - |
+      if [ -f target/site/jacoco/jacoco.xml ]; then
+        cp target/site/jacoco/jacoco.xml coverage.xml
+        COVERAGE_UNIT=$(python3 -c "
+      import xml.etree.ElementTree as ET
+      tree = ET.parse('coverage.xml')
+      root = tree.getroot()
+      total_instructions = 0
+      covered_instructions = 0
+      for counter in root.findall('.//counter[@type=\"INSTRUCTION\"]'):
+        covered_instructions += int(counter.get('covered', 0))
+        total_instructions += int(counter.get('missed', 0)) + int(counter.get('covered', 0))
+      if total_instructions > 0:
+        coverage = (covered_instructions / total_instructions) * 100
+        print(f'{coverage:.2f}')
+      else:
+          print('0')
+      ")
+      else
+        COVERAGE_UNIT=0
+      fi
+      echo "Total coverage: ${COVERAGE_UNIT}%"
+      echo "COVERAGE_UNIT=${COVERAGE_UNIT}" > coverage.env
+      MIN_COVERAGE_UNIT=30
+      if awk "BEGIN {exit !($COVERAGE_UNIT < $MIN_COVERAGE_UNIT)}"; then
+        echo "❌ Coverage ${COVERAGE_UNIT}% is below ${MIN_COVERAGE_UNIT}%"
+        exit 1
+      else
+        echo "✅ Coverage ${COVERAGE_UNIT}% is OK"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage.xml
+      - coverage.env
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      dotenv: coverage.env
+    expire_in: 1 week
+  coverage: '/Total coverage: \d+\.\d+%/'

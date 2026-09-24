@@ -1,0 +1,41 @@
+# Деплоим сервис через helm upgrade --install в нужный namespace/окружение.
+# Чарт и values-<environment>.yaml берём из отдельного helm-репозитория (не
+# храним чарты в репо сервиса). --rollback-on-failure откатит релиз сам,
+# если апгрейд не взлетел.
+.template:helm-deploy:
+  stage: deploy
+  image: ${INFRA_REGISTRY}/infra/helm-kubectl:4.2.3
+  tags:
+    - kubernetes
+  variables:
+    KUBE_NAMESPACE: "${NAMESPACE}"
+    HELM_REPO: "cluster-application/helm"
+    UNIFIED_IMAGE_TAG: ""
+  before_script:
+    - apk add --no-cache git
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - |
+      VALUES_FILE="values-${ENVIRONMENT_NAME}.yaml"
+      CHART_PATH="./${SERVICE_DIR}"
+      if [ -n "$UNIFIED_IMAGE_TAG" ]; then
+        IMAGE_TAG="$UNIFIED_IMAGE_TAG"
+      else
+        IMAGE_TAG="${CI_PIPELINE_ID}"
+      fi
+      echo "🔗 Deploying with image tag: ${IMAGE_TAG}"
+    - helm dependency update ${CHART_PATH}
+    - |
+      helm upgrade --install ${SERVICE_DIR} ${CHART_PATH} \
+        --namespace ${KUBE_NAMESPACE} \
+        --set image.registry=${INFRA_REGISTRY} \
+        --set image.tag=${IMAGE_TAG} \
+        --set migrations.image.registry=${INFRA_REGISTRY} \
+        --set migrations.image.tag=${IMAGE_TAG} \
+        -f ${CHART_PATH}/${VALUES_FILE} \
+        --rollback-on-failure \
+        --timeout 5m \
+        --wait-for-jobs
+    - helm status ${SERVICE_DIR} -n ${KUBE_NAMESPACE}
+    - kubectl get pods,hpa -n ${KUBE_NAMESPACE}

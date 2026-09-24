@@ -1,0 +1,39 @@
+# Откат одного сервиса на предыдущую успешную helm-ревизию. Не просто "на одну
+# назад" — через helm history ищем именно последнюю ревизию с описанием
+# "Upgrade complete", чтобы не откатиться на сам себя или на неудачный апгрейд.
+# Ручной запуск.
+.template:rollback:
+  stage: rollback
+  image: ${INFRA_REGISTRY}/infra/helm-kubectl:4.2.3
+  tags:
+    - kubernetes
+  variables:
+    KUBE_NAMESPACE: "${NAMESPACE}"
+    HELM_REPO: "cluster-application/helm"
+    MIGRATION_DOWN: "false"
+  before_script:
+    - apk add --no-cache git
+    - |
+      git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - |
+      echo "ROLLBACK ${SERVICE_DIR} in ${KUBE_NAMESPACE}"
+      echo "MIGRATION_DOWN: ${MIGRATION_DOWN}"
+      
+      # Создаем ConfigMap с флагом
+      kubectl create configmap migration-config \
+        -n ${KUBE_NAMESPACE} \
+        --from-literal=MIGRATION_DOWN_ENABLED=${MIGRATION_DOWN} \
+        --dry-run=client -o yaml | kubectl apply -f -
+      
+      helm history ${SERVICE_DIR} -n ${KUBE_NAMESPACE}
+      
+      CURRENT_REVISION=$(helm status ${SERVICE_DIR} -n ${KUBE_NAMESPACE} --output json | jq -r '.version')
+      PREVIOUS_REVISION=$(helm history ${SERVICE_DIR} -n ${KUBE_NAMESPACE} --max 50 --output json | jq -r "[.[] | select(.revision < ${CURRENT_REVISION}) | select(.description == \"Upgrade complete\")] | sort_by(.revision) | reverse | .[0].revision")
+      
+      echo "Rolling back from ${CURRENT_REVISION} to ${PREVIOUS_REVISION}"
+      helm rollback ${SERVICE_DIR} ${PREVIOUS_REVISION} -n ${KUBE_NAMESPACE} --wait --timeout 10m
+      
+      echo "ROLLBACK COMPLETED"
+  when: manual

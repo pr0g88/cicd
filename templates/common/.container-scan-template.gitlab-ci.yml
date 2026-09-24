@@ -1,0 +1,49 @@
+# Сканируем уже собранный образ (и образ миграций, если он есть) через Trivy.
+# В отличие от sca (сканит исходники/зависимости) — тут смотрим итоговый образ.
+# Не блокирует пайплайн, просто отчёт: сборка образов — не самое дешёвое место
+# для жёсткого гейта, полагаемся на sca выше по пайплайну.
+.template:container-scan:
+  stage: container-scan
+  image:
+    name: ${INFRA_REGISTRY}/security/trivy:0.74.0
+    entrypoint: [""]
+  tags:
+    - tests
+  allow_failure: true
+  needs: ["build"]
+  variables:
+    UNIFIED_IMAGE_TAG: ""
+  script:
+    - |
+      if [ -n "$UNIFIED_IMAGE_TAG" ]; then
+        IMAGE_TAG="$UNIFIED_IMAGE_TAG"
+      else
+        IMAGE_TAG="${CI_PIPELINE_ID}"
+      fi
+      IMAGE="${CI_REGISTRY}/${SERVICE_DIR}:${IMAGE_TAG}"
+      echo "📦 Scanning main image: ${IMAGE}"
+    - |
+      trivy image --insecure --username ${CI_REGISTRY_USER} --password ${CI_REGISTRY_PASSWORD} \
+        --format json --output ${CI_PROJECT_DIR}/trivy-container-results.json \
+        --severity HIGH,CRITICAL ${IMAGE} || true
+    - |
+      if [ -s ${CI_PROJECT_DIR}/trivy-container-results.json ]; then
+        VULNS=$(cat ${CI_PROJECT_DIR}/trivy-container-results.json | grep -c '"VulnerabilityID"' || true)
+        echo "⚠️ Trivy found ${VULNS} vulnerabilities in main image (not blocking)"
+      fi
+    - |
+      if [ -f "${CI_PROJECT_DIR}/migration-check.env" ]; then
+        source ${CI_PROJECT_DIR}/migration-check.env
+        if [ -n "$MIGRATION_IMAGE" ]; then
+          echo "📦 Scanning migration image: ${MIGRATION_IMAGE}"
+          trivy image --insecure --username ${CI_REGISTRY_USER} --password ${CI_REGISTRY_PASSWORD} \
+            --format json --output ${CI_PROJECT_DIR}/trivy-migration-results.json \
+            --severity HIGH,CRITICAL ${MIGRATION_IMAGE} || true
+        fi
+      fi
+  artifacts:
+    when: always
+    paths:
+      - trivy-container-results.json
+      - trivy-migration-results.json
+    expire_in: 1 week

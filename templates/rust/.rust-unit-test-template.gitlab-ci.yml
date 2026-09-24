@@ -1,0 +1,61 @@
+# Юнит-тесты + покрытие для Rust-сервисов через grcov (cargo-native инструменты
+# покрытия ещё сыроваты). Порог сейчас всего 4% — тестов пока мало, поднимем
+# по мере роста покрытия. Код уже в $CI_PROJECT_DIR, отдельно клонировать не надо.
+.template:rust-unit-test:
+  stage: unit-test
+  image: ${INFRA_REGISTRY}/lang/rust:1.88-slim
+  tags:
+    - tests
+  before_script:
+    - apt-get update -yqq
+    - apt-get install -yqq --no-install-recommends build-essential pkg-config libssl-dev python3 lcov
+    - rustup component add clippy rustfmt llvm-tools-preview
+    - cargo install grcov
+  script:
+    - |
+      export RUSTFLAGS="-C instrument-coverage"
+      export LLVM_PROFILE_FILE="coverage-%p-%m.profraw"
+      cargo test --all-features --verbose
+      cargo clippy --all-targets --all-features 2>/dev/null || true
+    - |
+      grcov . --binary-path ./target/debug/ -s . -t cobertura --branch --ignore-not-existing -o coverage.xml
+      grcov . --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing -o coverage.info
+    - |
+      COVERAGE_UNIT=$(python3 -c "
+      import re
+      total_lines = 0
+      covered_lines = 0
+      with open('coverage.info', 'r') as f:
+          for line in f:
+              if line.startswith('LF:'):
+                  total_lines += int(line.split(':')[1])
+              elif line.startswith('LH:'):
+                  covered_lines += int(line.split(':')[1])
+      if total_lines > 0:
+          coverage = (covered_lines / total_lines) * 100
+          print(f'{coverage:.2f}')
+      else:
+          print('0')
+      ")
+      echo "Total coverage: ${COVERAGE_UNIT}%"
+      echo "COVERAGE_UNIT=${COVERAGE_UNIT}" > coverage.env
+      MIN_COVERAGE_UNIT=4
+      if awk "BEGIN {exit !($COVERAGE_UNIT < $MIN_COVERAGE_UNIT)}"; then
+        echo "❌ Coverage ${COVERAGE_UNIT}% is below ${MIN_COVERAGE_UNIT}%"
+        exit 1
+      else
+        echo "✅ Coverage ${COVERAGE_UNIT}% is OK"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage.xml
+      - coverage.info
+      - coverage.env
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      dotenv: coverage.env
+    expire_in: 1 week
+  coverage: '/Total coverage: \d+\.\d+%/'

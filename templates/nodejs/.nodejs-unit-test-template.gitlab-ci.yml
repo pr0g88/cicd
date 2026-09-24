@@ -1,0 +1,40 @@
+# Юнит-тесты (Jest, npm test) + покрытие для Node.js-сервисов. Код уже
+# зачекаучен раннером, отдельно клонировать репо не нужно. Порог — 30%.
+.template:nodejs-unit-test:
+  stage: unit-test
+  image: ${INFRA_REGISTRY}/lang/node:18-alpine
+  tags:
+    - tests
+  before_script:
+    - npm install
+  script:
+    - npm test
+    - |
+      COVERAGE_UNIT=$(node -e "
+        const data = require('./coverage/coverage-summary.json');
+        console.log(data.total.lines.pct.toFixed(2));
+      ")
+      echo "Total coverage: ${COVERAGE_UNIT}%"
+      echo "COVERAGE_UNIT=${COVERAGE_UNIT}" > coverage.env
+    - |
+      MIN_COVERAGE_UNIT=30
+      if (( $(echo "$COVERAGE_UNIT < $MIN_COVERAGE_UNIT" | bc -l) )); then
+        echo "❌ Coverage ${COVERAGE_UNIT}% is below ${MIN_COVERAGE_UNIT}%"
+        exit 1
+      else
+        echo "✅ Coverage ${COVERAGE_UNIT}% is OK"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+      - junit.xml
+      - coverage.env
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      dotenv: coverage.env
+    expire_in: 1 week
+  coverage: '/Total coverage: \d+\.?\d*%/'

@@ -1,0 +1,38 @@
+# Юнит-тесты + покрытие для Go-сервисов. Код уже зачекаучен раннером в
+# $CI_PROJECT_DIR — отдельно клонировать репо не нужно. Порог покрытия — 30%,
+# ниже пайплайн падает.
+.template:go-unit-test:
+  stage: unit-test
+  image: ${INFRA_REGISTRY}/lang/golang:1.26-alpine
+  tags:
+    - tests
+  before_script:
+    - go mod download
+  script:
+    - |
+      go test -v -coverprofile=coverage.out -covermode=atomic ./...
+      go tool cover -func=coverage.out
+      go tool cover -html=coverage.out -o coverage.html
+    - |
+      COVERAGE_UNIT=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+      echo "Total coverage: ${COVERAGE_UNIT}%"
+      echo "COVERAGE_UNIT=${COVERAGE_UNIT}" > coverage.env
+      MIN_COVERAGE_UNIT=20
+      if awk "BEGIN {exit !($COVERAGE_UNIT < $MIN_COVERAGE_UNIT)}"; then
+        echo "❌ Coverage ${COVERAGE_UNIT}% is below ${MIN_COVERAGE_UNIT}%"
+        echo "UNIT_TEST=FAILED" >> coverage.env
+        exit 1
+      else
+        echo "✅ Coverage ${COVERAGE_UNIT}% is OK"
+        echo "UNIT_TEST=OK" >> coverage.env
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage.out
+      - coverage.html
+      - coverage.env
+    reports:
+      dotenv: coverage.env
+    expire_in: 1 week
+  coverage: '/Total coverage: \d+\.\d+%/'

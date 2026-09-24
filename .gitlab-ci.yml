@@ -1,0 +1,780 @@
+# Оркестратор релизов PizzaShop.
+# Запускается только по тегу vX.Y.Z в этом репо (ставится на HEAD ветки staging) —
+# значит "зафиксировать текущий staging всех сервисов + фронтенда как релиз".
+#
+# Порядок: generate-image-tag -> tag-service-repos -> create-release ->
+# trigger-*-service (сборка строго по только что созданному тегу) -> deploy-dev ->
+# deploy-staging -> e2e/dast -> deploy-prod (заглушка, manual).
+#
+# Теги: vX.Y.Z — релиз (запускает этот пайплайн), tpl-vX.Y.Z — версии CI/CD
+# шаблонов для include: в сервисных .gitlab-ci.yml, релиз не триггерят.
+
+include:
+  - local: '/templates/common/.send-notification-template.gitlab-ci.yml'
+  - local: '/variables/.job-vars.gitlab-ci.yml'
+
+# Пайплайн стартует только по тегу vX.Y.Z — условие вынесено сюда одним местом,
+# джобы ниже свои rules: под это не дублируют. Ручные гейты (deploy-prod,
+# rollback-*) — обычный when: manual без rules:.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+stages:
+  - .pre               # тег образа, тегирование сервисных репо, GitLab Release
+  - build               # сборка всех сервисов + фронтенда по тегу
+  - deploy               # deploy-dev -> deploy-staging; e2e-smoke-dev тоже тут (needs: deploy-dev)
+  - post-deploy-tests   # полный Playwright-прогон против staging
+  - dast                 # ZAP по staging после деплоя
+  - deploy-prod           # заглушка, manual, после dast/e2e
+  - rollback               # ручной откат релизов
+
+
+variables:
+  HELM_REPO: "cluster-application/helm"
+  E2E_TESTS_REPO: "cluster-application/e2e-tests"
+  # Ветка сервисных репозиториев, от которой ставится релизный тег
+  SOURCE_BRANCH_FOR_RELEASE: "staging"
+  # Путь репозитория фронтенда — отличается от backend-сервисов
+  # (app/frontend/web, а не app/backend/${svc})
+  FRONTEND_PROJECT_PATH: "cluster-application/app/frontend/web"
+  # Единый источник правды для списка бэкенд-сервисов — используют и
+  # tag-service-repos (тегирование репо), и create-release (таблица
+  # коммитов в release notes). Добавил сервис — правишь только тут.
+  BACKEND_SERVICES: "api-gateway catalog-service kitchen-service inventory-service order-service payment-service notification-service auth-service user-service delivery-service"
+
+
+# --- .pre: генерация тега образа ---
+generate-image-tag:
+  stage: .pre
+  image: ${INFRA_REGISTRY}/infra/alpine:3.24.2
+  tags:
+    - tests
+  script:
+    - |
+      echo "🏷️  === Генерация тега Docker-образа ==="
+      echo "CI_COMMIT_TAG: ${CI_COMMIT_TAG}"
+      echo "CI_COMMIT_SHORT_SHA: ${CI_COMMIT_SHORT_SHA}"
+      FINAL_TAG="${CI_COMMIT_TAG}-${CI_COMMIT_SHORT_SHA}"
+      echo "📦 Final image tag: ${FINAL_TAG}"
+      echo "UNIFIED_IMAGE_TAG=${FINAL_TAG}" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+
+
+# --- .pre: тегирование сервисных репозиториев ---
+# Тегирует staging каждого из 9 сервисов + фронтенда тегом ${CI_COMMIT_TAG} —
+# фиксирует точный набор коммитов релиза. Идемпотентно: повторный запуск
+# с уже существующим тегом не падает, а переиспользует его.
+# Фронтенд тегируется отдельно после цикла — его путь в GitLab (app/frontend/web)
+# не совпадает с паттерном app/backend/${svc}, по которому строятся пути сервисов.
+tag-service-repos:
+  stage: .pre
+  image: ${INFRA_REGISTRY}/infra/alpine:3.24.2
+  tags:
+    - tests
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      set -e
+      SERVICES="${BACKEND_SERVICES}"
+      FAILED=0
+      > service-shas.env
+
+      tag_repo() {
+        # $1 = PROJECT_PATH (полный путь в GitLab, напр. cluster-application/app/backend/api-gateway)
+        # $2 = VAR_NAME (имя переменной для service-shas.env, напр. API_GATEWAY_SHA)
+        # $3 = человекочитаемое имя для логов
+        local PROJECT_PATH="$1"
+        local VAR_NAME="$2"
+        local LABEL="$3"
+        local ENCODED_PATH
+        ENCODED_PATH=$(printf '%s' "${PROJECT_PATH}" | jq -sRr @uri)
+
+        echo "🏷️  Tagging ${LABEL} -> ${CI_COMMIT_TAG} (ref: ${SOURCE_BRANCH_FOR_RELEASE})"
+
+        HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+          --request POST \
+          --header "PRIVATE-TOKEN: ${RELEASE_API_TOKEN}" \
+          "https://${PUBLIC_DOMAIN}/api/v4/projects/${ENCODED_PATH}/repository/tags?tag_name=${CI_COMMIT_TAG}&ref=${SOURCE_BRANCH_FOR_RELEASE}")
+
+        if [ "${HTTP_CODE}" = "201" ]; then
+          SHA=$(jq -r '.commit.short_id' /tmp/resp.json)
+          echo "✅ ${LABEL}: тег создан на коммите ${SHA}"
+
+        elif [ "${HTTP_CODE}" = "400" ] && grep -qi "already exists" /tmp/resp.json; then
+          echo "⚠️  ${LABEL}: тег ${CI_COMMIT_TAG} уже существует, переиспользуем"
+          HTTP_CODE2=$(curl -s -o /tmp/resp2.json -w "%{http_code}" \
+            --header "PRIVATE-TOKEN: ${RELEASE_API_TOKEN}" \
+            "https://${PUBLIC_DOMAIN}/api/v4/projects/${ENCODED_PATH}/repository/tags/${CI_COMMIT_TAG}")
+          if [ "${HTTP_CODE2}" = "200" ]; then
+            SHA=$(jq -r '.commit.short_id' /tmp/resp2.json)
+          else
+            SHA="unknown"
+          fi
+
+        else
+          echo "❌ ${LABEL}: не удалось создать тег (HTTP ${HTTP_CODE})"
+          cat /tmp/resp.json
+          FAILED=1
+          SHA="FAILED"
+        fi
+
+        echo "${VAR_NAME}_SHA=${SHA}" >> service-shas.env
+      }
+
+      # --- Бэкенд-сервисы (app/backend/${svc}) ---
+      for svc in $SERVICES; do
+        PROJECT_PATH="cluster-application/app/backend/${svc}"
+        VAR_NAME=$(echo "${svc}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+        tag_repo "${PROJECT_PATH}" "${VAR_NAME}" "${svc}"
+      done
+
+      # --- Фронтенд (app/frontend/web) ---
+      tag_repo "${FRONTEND_PROJECT_PATH}" "FRONTEND" "frontend"
+
+      echo ""
+      echo "=== Итоговые SHA сервисов в релизе ${CI_COMMIT_TAG} ==="
+      cat service-shas.env
+
+      if [ "${FAILED}" = "1" ]; then
+        echo ""
+        echo "❌ Один или несколько сервисов не удалось тегировать. Релиз остановлен."
+        exit 1
+      fi
+  artifacts:
+    reports:
+      dotenv: service-shas.env
+    expire_in: 30 days
+
+
+# --- .pre: создание GitLab Release ---
+# release: ключ интерполирует переменные до script — dotenv-переменные из needs
+# (SHA'ы, UNIFIED_IMAGE_TAG) не всегда успевают подставиться, поэтому собираем
+# description сами и зовём release-cli напрямую.
+# Таблица коммитов строится по $BACKEND_SERVICES — добавил сервис туда,
+# он сам появится в таблице, без правки этого job'а.
+create-release:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - tests
+  needs:
+    - job: generate-image-tag
+      artifacts: true
+    - job: tag-service-repos
+      artifacts: true
+  script:
+    - |
+      set -e
+      echo "Создаём GitLab Release для ${CI_COMMIT_TAG}"
+
+      TABLE_ROWS=""
+      for svc in frontend ${BACKEND_SERVICES}; do
+        VAR_NAME=$(echo "${svc}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+        SHA_VAR_NAME="${VAR_NAME}_SHA"
+        eval "SHA_VALUE=\${${SHA_VAR_NAME}}"
+        TABLE_ROWS="${TABLE_ROWS}| ${svc} | \`${SHA_VALUE}\` |
+      "
+      done
+
+      cat > release-description.md << DESCEOF
+      ## 🚀 PizzaShop Release ${CI_COMMIT_TAG}
+
+      **Unified image tag:** \`${UNIFIED_IMAGE_TAG}\`
+      **Собрано из ветки:** \`${SOURCE_BRANCH_FOR_RELEASE}\`
+
+      ### Коммиты сервисов, вошедшие в релиз:
+      | Сервис | Коммит |
+      |---|---|
+      ${TABLE_ROWS}
+      Задеплоено на: dev → staging
+      DESCEOF
+
+      cat release-description.md
+
+      release-cli create \
+        --name "PizzaShop Release ${CI_COMMIT_TAG}" \
+        --tag-name "${CI_COMMIT_TAG}" \
+        --description "$(cat release-description.md)"
+
+
+# --- уведомление: релиз создан ---
+release-notify:
+  extends: .template:send-notification
+  stage: .pre
+  needs:
+    - job: generate-image-tag
+    - job: create-release
+  variables:
+    NOTIFY_TEXT: "🚀 PizzaShop: релиз ${CI_COMMIT_TAG} создан, деплой на dev/staging запущен.\n${CI_PIPELINE_URL}"
+
+
+# --- build: триггеры сборки микросервисов и фронтенда ---
+# branch: $CI_COMMIT_TAG — собираем строго тег, который только что поставили
+# в tag-service-repos, а не текущий staging.
+
+trigger-frontend:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/frontend/web
+    branch: "$CI_COMMIT_TAG"
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-api-gateway:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/api-gateway
+    branch: "$CI_COMMIT_TAG"
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-catalog-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/catalog-service
+    branch: "$CI_COMMIT_TAG"
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-kitchen-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/kitchen-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-inventory-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/inventory-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-order-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/order-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-payment-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/payment-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-notification-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/notification-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-auth-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/auth-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-user-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/user-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+trigger-delivery-service:
+  stage: build
+  variables:
+    UNIFIED_IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  trigger:
+    project: cluster-application/app/backend/delivery-service
+    branch: $CI_COMMIT_TAG
+    strategy: depend
+    forward:
+      yaml_variables: true
+  needs:
+    - job: generate-image-tag
+    - job: tag-service-repos
+
+
+# --- deploy: dev ---
+deploy-dev:
+  stage: deploy
+  image: ${INFRA_REGISTRY}/infra/helmfile:0.163.1
+  tags:
+    - kubernetes
+  resource_group: dev
+  variables:
+    IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  before_script:
+    - echo "🚀 Deploying to DEV with unified tag ${IMAGE_TAG}"
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - helmfile -f helmfile-dev.yaml apply --state-values-set image.registry=${INFRA_REGISTRY} --state-values-set image.tag=${IMAGE_TAG}
+  environment:
+    name: $DEV_ENV_NAME
+  needs:
+    - job: generate-image-tag
+    - job: trigger-frontend
+      optional: true
+    - job: trigger-api-gateway
+      optional: true
+    - job: trigger-catalog-service
+      optional: true
+    - job: trigger-kitchen-service
+      optional: true
+    - job: trigger-inventory-service
+      optional: true
+    - job: trigger-order-service
+      optional: true
+    - job: trigger-payment-service
+      optional: true
+    - job: trigger-notification-service
+      optional: true
+    - job: trigger-auth-service
+      optional: true
+    - job: trigger-user-service
+      optional: true
+    - job: trigger-delivery-service
+      optional: true
+
+
+# --- e2e smoke: dev (быстрая проверка сразу после деплоя на dev) ---
+# Быстрый дымовой Playwright-прогон по dev — ловит явные поломки до того, как
+# релиз уйдёт на staging. stage: deploy (не post-deploy-tests), т.к. needs
+# у deploy-staging ниже может ссылаться только на job той же или более ранней стадии.
+# allow_failure: true — это ранний сигнал, не жёсткий гейт; настоящий гейт релиза — e2e-staging.
+e2e-smoke-dev:
+  stage: deploy
+  image: ${INFRA_REGISTRY}/autotest/playwright:v1.63.0-noble
+  tags:
+    - tests
+  allow_failure: true
+  variables:
+    BASE_URL: "https://${PUBLIC_DOMAIN}/shop-dev/"
+  before_script:
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${E2E_TESTS_REPO}.git ${CI_PROJECT_DIR}/e2e-tests
+    - cd ${CI_PROJECT_DIR}/e2e-tests
+    - npm install
+  script:
+    - npx playwright test tests/smoke.spec.ts
+  artifacts:
+    when: always
+    paths:
+      - e2e-tests/playwright-report/
+      - e2e-tests/test-results/
+    reports:
+      junit: e2e-tests/test-results/junit.xml
+    expire_in: 1 week
+  needs:
+    - job: deploy-dev
+
+
+# --- deploy: staging ---
+deploy-staging:
+  stage: deploy
+  image: ${INFRA_REGISTRY}/infra/helmfile:0.163.1
+  tags:
+    - kubernetes
+  resource_group: staging
+  variables:
+    IMAGE_TAG: "${UNIFIED_IMAGE_TAG}"
+  before_script:
+    - echo "🚀 Deploying to STAGING with unified tag ${IMAGE_TAG}"
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - helmfile -f helmfile-staging.yaml apply --state-values-set image.registry=${INFRA_REGISTRY} --state-values-set image.tag=${IMAGE_TAG}
+  environment:
+    name: $STAGING_ENV_NAME
+  needs:
+    - job: generate-image-tag
+    - deploy-dev
+    - job: e2e-smoke-dev
+
+
+# --- уведомление: staging готов ---
+staging-ready-notify:
+  extends: .template:send-notification
+  stage: deploy
+  needs:
+    - job: deploy-staging
+  variables:
+    NOTIFY_TEXT: "✅ PizzaShop ${CI_COMMIT_TAG}: staging готов (https://${PUBLIC_DOMAIN}/shop-staging/). Дальше — e2e + DAST.\n${CI_PIPELINE_URL}"
+
+
+# --- e2e: staging (полный набор сценариев Playwright) ---
+# Полный прогон против реального staging: регистрация/логин, каталог, корзина,
+# оформление заказа, отмена заказа. Тестовый пользователь создаётся через API
+# (POST /register) с уникальным email на каждый прогон.
+#
+# stage: post-deploy-tests, но needs указан явно (deploy-staging) — job стартует
+# сразу как только деплой готов, параллельно с dast-frontend/dast-api-gateway,
+# а не после барьера стадии.
+#
+# allow_failure: true на время обкатки сьюта — снять, когда набор станет стабильным.
+e2e-staging:
+  stage: post-deploy-tests
+  image: ${INFRA_REGISTRY}/autotest/playwright:v1.63.0-noble
+  tags:
+    - tests
+  allow_failure: true
+  variables:
+    BASE_URL: "https://${PUBLIC_DOMAIN}/shop-staging/"
+  before_script:
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${E2E_TESTS_REPO}.git ${CI_PROJECT_DIR}/e2e-tests
+    - cd ${CI_PROJECT_DIR}/e2e-tests
+    - npm install
+  script:
+    - npx playwright test
+  artifacts:
+    when: always
+    paths:
+      - e2e-tests/playwright-report/
+      - e2e-tests/test-results/
+    reports:
+      junit: e2e-tests/test-results/junit.xml
+    expire_in: 1 week
+  needs:
+    - job: deploy-staging
+
+
+# --- dast: динамическое сканирование staging после деплоя ---
+# Сканирует уже поднятые staging-инстансы (а не исходники/образы, как sast/sca/container-scan).
+#   dast-frontend    — zap-baseline.py: спайдер + пассивный скан живого UI
+#   dast-api-gateway — zap-api-scan.py по OpenAPI-спеке api-gateway, транзитивно
+#                       покрывает и бэкенды за ним, так что их отдельно не сканируем
+# allow_failure: true, как sast/container-scan — отчёт публикуется, но не блокирует прод.
+dast-frontend:
+  stage: dast
+  image: ${INFRA_REGISTRY}/security/zap:2.16.1  # TODO: смиррорить zaproxy/zap-stable в реестр, как остальные security-образы
+  tags:
+    - kubernetes
+  allow_failure: true
+  variables:
+    # frontend-staging.internal нигде не резолвится — внутреннего DNS для него нет,
+    # это виртуальный host, который распознаёт только внешний nginx (${PUBLIC_DOMAIN}),
+    # проксирующий на NodePort ingress-nginx (${INFRA_CLUSTER_IP}:30080). Идём напрямую по
+    # IP:порту NodePort, а нужный Host-заголовок подставляет сам ZAP через аддон
+    # Replacer (в /etc/hosts пода не пишем — там нет прав на запись у юзера zap).
+    TARGET_HOST: "frontend-staging.internal"
+    TARGET_IP: "${INFRA_CLUSTER_IP}"
+    TARGET_URL: "http://${INFRA_CLUSTER_IP}:30080"
+    ZAP_REPLACER_ARGS: >-
+      -config replacer.full_list(0).description=rewrite-host
+      -config replacer.full_list(0).enabled=true
+      -config replacer.full_list(0).matchtype=REQ_HEADER
+      -config replacer.full_list(0).matchstr=Host
+      -config replacer.full_list(0).regex=false
+      -config replacer.full_list(0).replacement=${TARGET_HOST}
+  script:
+    - mkdir -p /zap/wrk
+    - zap-baseline.py -t ${TARGET_URL} -z "${ZAP_REPLACER_ARGS}" -J zap-frontend-report.json -r zap-frontend-report.html -I || true
+    - cp /zap/wrk/zap-frontend-report.json ${CI_PROJECT_DIR}/ 2>/dev/null || true
+    - cp /zap/wrk/zap-frontend-report.html ${CI_PROJECT_DIR}/ 2>/dev/null || true
+  artifacts:
+    when: always
+    paths:
+      - zap-frontend-report.json
+      - zap-frontend-report.html
+    expire_in: 1 week
+  needs:
+    - job: deploy-staging
+
+dast-api-gateway:
+  stage: dast
+  image: ${INFRA_REGISTRY}/security/zap:2.16.1  # TODO: смиррорить zaproxy/zap-stable
+  tags:
+    - kubernetes
+  allow_failure: true
+  variables:
+    # api-gateway отдаёт спеку по GET /swagger/openapi.yaml (go:embed, см. cmd/main.go).
+    # servers.url в спеке относительный, так что NodePort-порт сохранится и в запросах
+    # самого скана. Host-заголовок — тем же способом через Replacer, что и в dast-frontend.
+    TARGET_HOST: "api-gateway-staging.internal"
+    TARGET_IP: "${INFRA_CLUSTER_IP}"
+    TARGET_OPENAPI_URL: "http://${INFRA_CLUSTER_IP}:30080/swagger/openapi.yaml"
+    ZAP_REPLACER_ARGS: >-
+      -config replacer.full_list(0).description=rewrite-host
+      -config replacer.full_list(0).enabled=true
+      -config replacer.full_list(0).matchtype=REQ_HEADER
+      -config replacer.full_list(0).matchstr=Host
+      -config replacer.full_list(0).regex=false
+      -config replacer.full_list(0).replacement=${TARGET_HOST}
+  script:
+    - mkdir -p /zap/wrk
+    - zap-api-scan.py -t ${TARGET_OPENAPI_URL} -f openapi -z "${ZAP_REPLACER_ARGS}" -J zap-api-report.json -r zap-api-report.html -I || true
+    - cp /zap/wrk/zap-api-report.json ${CI_PROJECT_DIR}/ 2>/dev/null || true
+    - cp /zap/wrk/zap-api-report.html ${CI_PROJECT_DIR}/ 2>/dev/null || true
+  artifacts:
+    when: always
+    paths:
+      - zap-api-report.json
+      - zap-api-report.html
+    expire_in: 1 week
+  needs:
+    - job: deploy-staging
+
+# --- уведомление: prod ждёт аппрува ---
+# Уходит, когда e2e-staging и оба DAST-скана завершились (успешно или нет —
+# все три allow_failure: true) и deploy-prod готов к ручному запуску.
+prod-approval-notify:
+  extends: .template:send-notification
+  stage: dast
+  needs:
+    - job: dast-frontend
+    - job: dast-api-gateway
+    - job: e2e-staging
+  variables:
+    NOTIFY_TEXT: "🟡 PizzaShop ${CI_COMMIT_TAG}: staging/e2e/DAST пройдены, ждём аппрув на prod (manual gate).\n${CI_PIPELINE_URL}"
+
+# --- dry-run: prod ---
+# Запускается сам, как только staging/e2e/DAST готовы — до ручного deploy-prod.
+# Печатает, что было бы задеплоено, реального деплоя не делает. Prod-окружения
+# в этом учебном проекте нет (нет helmfile-prod.yaml), поэтому и это, и
+# deploy-prod ниже — заглушки для демонстрации паттерна "просмотр перед аппрувом".
+dry-run-prod:
+  stage: deploy-prod
+  image: ${INFRA_REGISTRY}/infra/alpine:3.24.2
+  tags:
+    - tests
+  script:
+    - |
+      echo "🔍 DRY-RUN перед деплоем в PROD (реального деплоя не делает)"
+      echo "Release tag: ${CI_COMMIT_TAG}"
+      echo "Целевое окружение: ${PROD_ENV_NAME}"
+      echo "Что было бы задеплоено: services + frontend по unified image tag ${UNIFIED_IMAGE_TAG}"
+      echo "Дальше — ручной аппрув job'а deploy-prod (protected environment)."
+  needs:
+    - job: deploy-staging
+    - job: dast-frontend
+    - job: dast-api-gateway
+    - job: e2e-staging
+    - job: generate-image-tag
+  allow_failure: true
+
+# --- deploy: prod (заглушка) ---
+# Учебный проект в prod не деплоит — job оставлен как демонстрация protected
+# environment + manual gate.
+deploy-prod:
+  stage: deploy-prod
+  image: ${INFRA_REGISTRY}/infra/alpine:3.24.2
+  tags:
+    - tests
+  script:
+    - |
+      echo "🚧 PROD деплой не реализован в этом учебном проекте."
+      echo "Это заглушка, демонстрирующая ручной approval gate и protected environment."
+      echo "Release tag ${CI_COMMIT_TAG}"
+  environment:
+    name: $PROD_ENV_NAME
+  needs:
+    - job: deploy-staging
+    - job: dast-frontend
+    - job: dast-api-gateway
+    - job: e2e-staging
+    - job: dry-run-prod
+  when: manual
+  allow_failure: true
+
+# --- уведомление: prod задеплоен ---
+prod-deployed-notify:
+  extends: .template:send-notification
+  stage: deploy-prod
+  needs:
+    - job: deploy-prod
+  variables:
+    NOTIFY_TEXT: "🎉 PizzaShop ${CI_COMMIT_TAG}: задеплоен на prod (заглушка).\n${CI_PIPELINE_URL}"
+
+# --- rollback: dev ---
+rollback-dev:
+  stage: rollback
+  image: ${INFRA_REGISTRY}/infra/helmfile:0.163.1
+  tags:
+    - kubernetes
+  resource_group: dev
+  variables:
+    IMAGE_TAG: ""
+  before_script:
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - |
+      set -e
+      FAILED=0
+      if [ -z "$IMAGE_TAG" ]; then
+        echo "⏪ Rolling back DEV to previous Helm revision..."
+
+        # Сервисы с релиз-именем "<svc>-service"
+        for svc in kitchen catalog inventory order payment notification auth user delivery; do
+          if ! helm rollback ${svc}-service -n pizzashop-dev; then
+            echo "❌ Rollback failed for ${svc}-service"
+            FAILED=1
+          fi
+        done
+
+        # api-gateway и frontend — релиз-имя без суффикса "-service"
+        for release in api-gateway frontend; do
+          if ! helm rollback ${release} -n pizzashop-dev; then
+            echo "❌ Rollback failed for ${release}"
+            FAILED=1
+          fi
+        done
+
+        if [ "$FAILED" = "1" ]; then
+          echo "❌ Один или несколько сервисов не откатились. Проверь состояние вручную!"
+          exit 1
+        fi
+      else
+        echo "🎯 Rolling back DEV to specific tag: ${IMAGE_TAG}"
+        helmfile -f helmfile-dev.yaml apply --state-values-set image.registry=${INFRA_REGISTRY} --state-values-set image.tag=${IMAGE_TAG}
+      fi
+  environment:
+    name: $DEV_ENV_NAME
+  when: manual
+  allow_failure: true
+
+
+# --- rollback: staging ---
+rollback-staging:
+  stage: rollback
+  image: ${INFRA_REGISTRY}/infra/helmfile:0.163.1
+  tags:
+    - kubernetes
+  resource_group: staging
+  variables:
+    IMAGE_TAG: ""
+  before_script:
+    - git clone --depth 1 https://${GROUP_DEPLOY_TOKEN_USERNAME}:${GROUP_DEPLOY_TOKEN_PASSWORD}@${PUBLIC_DOMAIN}/${HELM_REPO}.git /tmp/helm
+    - cd /tmp/helm
+  script:
+    - |
+      set -e
+      FAILED=0
+      if [ -z "$IMAGE_TAG" ]; then
+        echo "⏪ Rolling back STAGING to previous Helm revision..."
+
+        # Сервисы с релиз-именем "<svc>-service"
+        for svc in kitchen catalog inventory order payment notification auth user delivery; do
+          if ! helm rollback ${svc}-service -n pizzashop-staging; then
+            echo "❌ Rollback failed for ${svc}-service"
+            FAILED=1
+          fi
+        done
+
+        # api-gateway и frontend — релиз-имя без суффикса "-service"
+        for release in api-gateway frontend; do
+          if ! helm rollback ${release} -n pizzashop-staging; then
+            echo "❌ Rollback failed for ${release}"
+            FAILED=1
+          fi
+        done
+
+        if [ "$FAILED" = "1" ]; then
+          echo "❌ Один или несколько сервисов не откатились. Проверь состояние вручную!"
+          exit 1
+        fi
+      else
+        echo "🎯 Rolling back STAGING to specific tag: ${IMAGE_TAG}"
+        helmfile -f helmfile-staging.yaml apply --state-values-set image.registry=${INFRA_REGISTRY} --state-values-set image.tag=${IMAGE_TAG}
+      fi
+  environment:
+    name: $STAGING_ENV_NAME
+  when: manual
+  allow_failure: true
+
+# --- rollback: prod (заглушка) ---
+# Как и deploy-prod, реального prod-деплоя в проекте нет, откатывать по-настоящему
+# нечего — job демонстрирует тот же manual gate для полноты картины release/rollback.
+rollback-prod:
+  stage: rollback
+  image: ${INFRA_REGISTRY}/infra/alpine:3.24.2
+  tags:
+    - tests
+  script:
+    - |
+      echo "🚧 PROD откат не реализован в этом учебном проекте."
+      echo "Это заглушка, демонстрирующая ручной approval gate и protected environment."
+      echo "Release tag ${CI_COMMIT_TAG}"
+  environment:
+    name: $PROD_ENV_NAME
+  when: manual
+  allow_failure: true

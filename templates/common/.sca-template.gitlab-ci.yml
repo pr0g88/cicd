@@ -1,0 +1,37 @@
+# Проверяем зависимости сервиса на известные уязвимости через Trivy (filesystem-скан,
+# не образ — это отдельно, см. container-scan). Блокирует релиз, если нашли
+# HIGH/CRITICAL с доступным фиксом.
+.template:sca:
+  stage: sca
+  image:
+    name: ${INFRA_REGISTRY}/security/trivy:0.74.0
+    entrypoint: [""]
+  tags:
+    - tests
+  script:
+    - |
+      IGNORE_ARGS=""
+      if [ -f ".trivyignore" ]; then
+        echo "Найден .trivyignore, применяю"
+        IGNORE_ARGS="--ignorefile .trivyignore"
+      fi
+      # --ignore-unfixed: не валим пайплайн из-за уязвимостей, на которые ещё нет патча —
+      # такие всё равно нечем чинить прямо сейчас. Если хочешь принять риск по конкретной
+      # уязвимости с доступным фиксом — добавь её CVE-ID в .trivyignore сервиса.
+      trivy fs --format json --output /tmp/trivy-sca-results.json \
+        --severity HIGH,CRITICAL --ignore-unfixed ${IGNORE_ARGS} .
+      cp /tmp/trivy-sca-results.json ${CI_PROJECT_DIR}/trivy-sca-results.json
+    - |
+      VULNS=$(cat ${CI_PROJECT_DIR}/trivy-sca-results.json | grep -c '"VulnerabilityID"' || true)
+      if [ "$VULNS" -gt 0 ]; then
+        echo "❌ Trivy SCA нашёл ${VULNS} уязвимостей HIGH/CRITICAL с доступным фиксом"
+        cat ${CI_PROJECT_DIR}/trivy-sca-results.json | head -50
+        exit 1
+      else
+        echo "✅ Уязвимостей с доступным фиксом не найдено"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - trivy-sca-results.json
+    expire_in: 1 week

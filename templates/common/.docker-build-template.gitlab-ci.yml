@@ -1,0 +1,45 @@
+# Собираем и пушим образ сервиса, плюс образ миграций, если в репо есть
+# Dockerfile.migrations. Тег — либо единый релизный (пробрасывается из
+# оркестратора через UNIFIED_IMAGE_TAG), либо локальный CI_PIPELINE_ID
+# для обычных пушей и MR вне релиза.
+.template:docker-build:
+  stage: build
+  image: ${INFRA_REGISTRY}/infra/docker:24.0.9
+  tags:
+    - builder
+  variables:
+    DOCKER_HOST: "unix:///var/run/docker.sock"
+    UNIFIED_IMAGE_TAG: ""
+  script:
+    - |
+      if [ -n "$UNIFIED_IMAGE_TAG" ]; then
+        TAG="$UNIFIED_IMAGE_TAG"
+        echo "🔗 Using unified release tag: ${TAG}"
+      else
+        TAG="${CI_PIPELINE_ID}"
+        echo "🏠 Using local pipeline tag: ${TAG}"
+      fi
+    - echo "Building ${SERVICE_DIR} with tag ${TAG}"
+    # Сборка основного образа
+    - docker build --pull -t ${CI_REGISTRY}/${SERVICE_DIR}:${TAG} .
+    - docker push ${CI_REGISTRY}/${SERVICE_DIR}:${TAG}
+    # Сборка образа миграций (если есть)
+    - |
+      if [ -f "Dockerfile.migrations" ]; then
+        echo "🔨 Building migration image with tag ${TAG}"
+        docker build --pull -f Dockerfile.migrations -t ${CI_REGISTRY}/${SERVICE_DIR}-migrations:${TAG} .
+        docker push ${CI_REGISTRY}/${SERVICE_DIR}-migrations:${TAG}
+        echo "MIGRATION_IMAGE=${CI_REGISTRY}/${SERVICE_DIR}-migrations:${TAG}" > ${CI_PROJECT_DIR}/migration-check.env
+        echo "MIGRATION_TAG=${TAG}" >> ${CI_PROJECT_DIR}/migration-check.env
+      else
+        echo "⚠️ Dockerfile.migrations not found"
+        echo "MIGRATION_IMAGE=" > ${CI_PROJECT_DIR}/migration-check.env
+        echo "MIGRATION_TAG=" >> ${CI_PROJECT_DIR}/migration-check.env
+      fi
+  artifacts:
+    when: always
+    paths:
+      - migration-check.env
+    reports:
+      dotenv: migration-check.env
+    expire_in: 1 week

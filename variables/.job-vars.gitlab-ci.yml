@@ -1,0 +1,5 @@
+# Глобальный variables: — подключается через include: в cicd/.gitlab-ci.yml
+variables:
+  DEV_ENV_NAME: "dev"
+  STAGING_ENV_NAME: "staging"
+  PROD_ENV_NAME: "prod"

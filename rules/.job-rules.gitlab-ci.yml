@@ -1,0 +1,92 @@
+# Якоря для условий
+.if-merge-request-dev: &if-merge-request-dev
+  if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev"'
+
+.if-merge-request-staging: &if-merge-request-staging
+  if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "staging"'
+
+.if-merge-request-main: &if-merge-request-main
+  if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+
+.if-branch-dev: &if-branch-dev
+  if: '$CI_COMMIT_BRANCH == "dev"'
+
+.if-branch-develop: &if-branch-develop
+  if: '$CI_COMMIT_BRANCH == "develop"'
+
+.if-branch-staging: &if-branch-staging
+  if: '$CI_COMMIT_BRANCH == "staging"'
+
+.if-branch-main: &if-branch-main
+  if: '$CI_COMMIT_BRANCH == "main"'
+
+# Правила для тестирования
+.rules:test:
+  rules:
+    - <<: *if-merge-request-dev
+      variables:
+        ENVIRONMENT_NAME: "dev"
+    - <<: *if-merge-request-staging
+      variables:
+        ENVIRONMENT_NAME: "staging"
+    - <<: *if-merge-request-main
+      variables:
+        ENVIRONMENT_NAME: "prod"
+    - <<: *if-branch-dev
+      variables:
+        ENVIRONMENT_NAME: "dev"
+    - <<: *if-branch-develop
+      variables:
+        ENVIRONMENT_NAME: "dev"
+    - <<: *if-branch-staging
+      variables:
+        ENVIRONMENT_NAME: "staging"
+    - <<: *if-branch-main
+      variables:
+        ENVIRONMENT_NAME: "prod"
+
+# Правила для сборки
+.rules:build:
+  rules:
+    - <<: *if-branch-dev
+      variables:
+        ENVIRONMENT_NAME: "dev"
+    - <<: *if-branch-develop
+      variables:
+        ENVIRONMENT_NAME: "dev"
+    - <<: *if-branch-staging
+      variables:
+        ENVIRONMENT_NAME: "staging"
+    - <<: *if-branch-main
+      variables:
+        ENVIRONMENT_NAME: "prod"
+
+# Правила для деплоя на dev
+.rules:deploy-dev:
+  rules:
+    - <<: *if-branch-dev
+      variables:
+        ENVIRONMENT_NAME: "dev"
+        SERVER_HOST: "dev-server.local"
+    - <<: *if-branch-develop
+      variables:
+        ENVIRONMENT_NAME: "dev"
+        SERVER_HOST: "dev-server.local"
+
+# Правила для деплоя на staging
+.rules:deploy-staging:
+  rules:
+    - <<: *if-branch-staging
+      variables:
+        ENVIRONMENT_NAME: "staging"
+        SERVER_HOST: "staging-server.local"
+
+# Правила для деплоя на production (ручной)
+.rules:deploy-prod:
+  rules:
+    - <<: *if-branch-main
+      when: manual
+      allow_failure: false
+      variables:
+        ENVIRONMENT_NAME: "prod"
+        SERVER_HOST: "prod-server.local"
