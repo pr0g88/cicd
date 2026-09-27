@@ -31,6 +31,7 @@ stages:
   - dast                 # ZAP по staging после деплоя
   - deploy-prod           # заглушка, manual, после dast/e2e
   - rollback               # ручной откат релизов
+  - diagnose               # AI-разбор упавшей джобы (запускается только on_failure)
 
 
 variables:
@@ -781,3 +782,31 @@ rollback-prod:
     name: $PROD_ENV_NAME
   when: manual
   allow_failure: true
+
+
+# --- diagnose: AI-разбор упавшей джобы ---
+# Срабатывает только если пайплайн уже упал (rules: on_failure) — в норме
+# эта джоба не запускается вообще. Достаёт лог упавшей джобы через GitLab API,
+# просит Kimi (moonshotai/kimi-k2.6, через ProxyAPI) коротко объяснить причину,
+# шлёт результат в тот же Telegram-relay, что и .template:send-notification.
+# allow_failure: true — если сама диагностика не удалась (ProxyAPI недоступен,
+# GitLab API не ответил), это не должно давать ещё один "красный" в пайплайне.
+#
+# Нужны CI/CD-переменные (Settings -> CI/CD -> Variables):
+#   PROXYAPI_KEY      — ключ ProxyAPI (Masked, Protected — это платный секрет)
+#   GITLAB_API_TOKEN  — Project/Group Access Token с read_api (Masked, Protected);
+#                       опционально — без него скрипт пробует CI_JOB_TOKEN,
+#                       но его прав на чтение чужих джоб может не хватить
+# TG_NOTIFY_* уже заведены для .template:send-notification, отдельно заводить не нужно.
+ai-diagnose-failure:
+  stage: diagnose
+  image: ${INFRA_REGISTRY}/lang/python:3.12-slim
+  tags:
+    - tests
+  rules:
+    - when: on_failure
+  allow_failure: true
+  before_script:
+    - pip install --no-cache-dir --quiet openai requests
+  script:
+    - python3 scripts/ai-diagnose-failure.py
